@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-from torch.nn import Transformer
 from transformers import get_linear_schedule_with_warmup
 import math
 
@@ -13,11 +12,11 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(1)
         self.register_buffer('pe', pe)
         
     def forward(self, x):
-        return x + self.pe[:x.size(0)]
+        # x shape: (batch_size, seq_len, d_model)
+        return x + self.pe[:x.size(1)].unsqueeze(0)
     
 class ChatTransformer(pl.LightningModule):
     def __init__(self, config, tokenizer, num_training_steps):
@@ -36,50 +35,61 @@ class ChatTransformer(pl.LightningModule):
             config['model']['max_seq_length']
         )
         
-        self.transformer = Transformer(
+        # Use decoder-only architecture
+        decoder_layer = nn.TransformerDecoderLayer(
             d_model=config['model']['d_model'],
             nhead=config['model']['nhead'],
-            num_encoder_layers=config['model']['num_encoder_layers'],
-            num_decoder_layers=config['model']['num_decoder_layers'],
             dim_feedforward=config['model']['dim_feedforward'],
             dropout=config['model']['dropout'],
-            batch_first=False
+            batch_first=True
+        )
+        
+        self.transformer = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=config['model']['num_decoder_layers']
         )
         
         self.fc_out = nn.Linear(
             config['model']['d_model'],
             tokenizer.vocab_size
         )
-        self.criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-        
-    def create_padding_mask(self, tensor):
-        return (tensor == self.tokenizer.pad_token_id).bool()
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
         
     def create_causal_mask(self, size):
-        mask = self.transformer.generate_square_subsequent_mask(size).to(self.device)
-        return mask.bool()
+        # Create lower triangular mask (allows attending to previous positions)
+        mask = torch.triu(torch.ones(size, size), diagonal=1).bool()
+        return mask
         
-    def forward(self, src, tgt):
-        src = src.transpose(0, 1)
-        tgt = tgt.transpose(0, 1) 
+    def create_padding_mask(self, tensor):
+        # Create mask for padding tokens
+        return (tensor == self.tokenizer.pad_token_id)
         
-        src_padding_mask = self.create_padding_mask(src.transpose(0, 1))
-        tgt_padding_mask = self.create_padding_mask(tgt.transpose(0, 1))
-        tgt_mask = self.create_causal_mask(tgt.size(0))
+    def forward(self, input_ids, attention_mask=None):
+        batch_size, seq_len = input_ids.shape
         
-        src = self.embedding(src) * math.sqrt(self.config['model']['d_model'])
-        tgt = self.embedding(tgt) * math.sqrt(self.config['model']['d_model'])
+        # Create causal mask
+        tgt_mask = self.create_causal_mask(seq_len).to(input_ids.device)
         
-        src = self.pos_encoder(src)
-        tgt = self.pos_encoder(tgt)
+        # Create padding mask
+        if attention_mask is not None:
+            key_padding_mask = ~attention_mask.bool()
+        else:
+            key_padding_mask = self.create_padding_mask(input_ids)
+        
+        # Embeddings with scaling
+        x = self.embedding(input_ids) * math.sqrt(self.config['model']['d_model'])
+        x = self.pos_encoder(x)
+        
+        # For decoder-only, memory is the same as input
+        memory = x
         
         # Transform
         output = self.transformer(
-            src, tgt,
+            tgt=x,
+            memory=memory,
             tgt_mask=tgt_mask,
-            src_key_padding_mask=src_padding_mask,
-            tgt_key_padding_mask=tgt_padding_mask,
-            memory_key_padding_mask=src_padding_mask
+            tgt_key_padding_mask=key_padding_mask,
+            memory_key_padding_mask=key_padding_mask
         )
         
         # Project to vocabulary size
@@ -88,30 +98,58 @@ class ChatTransformer(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
         labels = batch['labels']
         
-        outputs = self(input_ids, labels[:, :-1])
-        outputs = outputs.transpose(0, 1)
+        # Debug: Check for any invalid values
+        if torch.any(labels < -100) or torch.any(labels >= self.tokenizer.vocab_size):
+            print(f"Warning: Invalid label values found. Min: {labels.min()}, Max: {labels.max()}")
+            print(f"Vocab size: {self.tokenizer.vocab_size}")
+        
+        # Forward pass with input shifted by one position for language modeling
+        outputs = self(input_ids[:, :-1], attention_mask[:, :-1])
+        
+        # Calculate loss (predict next token)
+        targets = labels[:, 1:].contiguous()
+        
+        # Ensure targets are within valid range
+        valid_targets = (targets >= 0) & (targets < self.tokenizer.vocab_size)
+        if not torch.all(valid_targets | (targets == -100)):
+            print(f"Warning: Some targets are out of range: {targets[~valid_targets & (targets != -100)]}")
         
         loss = self.criterion(
             outputs.reshape(-1, outputs.shape[-1]),
-            labels[:, 1:].reshape(-1)
+            targets.reshape(-1)
         )
-        self.log('train_loss', loss, prog_bar=True)
+        
+        self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True)
         return loss
     
     def validation_step(self, batch, batch_idx):
         input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
         labels = batch['labels']
         
-        outputs = self(input_ids, labels[:, :-1])
-        outputs = outputs.transpose(0, 1)
+        # Forward pass
+        outputs = self(input_ids[:, :-1], attention_mask[:, :-1])
+        
+        # Calculate loss
+        targets = labels[:, 1:].contiguous()
+        
+        # Additional safety check
+        if torch.any(targets >= self.tokenizer.vocab_size) and torch.any(targets != -100):
+            invalid_mask = (targets >= self.tokenizer.vocab_size) & (targets != -100)
+            print(f"Warning in validation: Invalid targets found: {targets[invalid_mask]}")
+            # Clamp invalid values to -100
+            targets[invalid_mask] = -100
         
         loss = self.criterion(
             outputs.reshape(-1, outputs.shape[-1]),
-            labels[:, 1:].reshape(-1)
+            targets.reshape(-1)
         )
-        self.log('val_loss', loss, prog_bar=True)
+        
+        self.log('val_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
+        return loss
         
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -126,4 +164,11 @@ class ChatTransformer(pl.LightningModule):
             num_training_steps=self.num_training_steps
         )
         
-        return [optimizer], [scheduler]
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
