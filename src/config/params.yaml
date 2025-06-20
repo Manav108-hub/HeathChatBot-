@@ -5,12 +5,12 @@ model:
   num_decoder_layers: 6
   dim_feedforward: 2048
   dropout: 0.1
-  max_seq_length: 128
+  max_seq_length: 256
 
 training:
-  batch_size: 32
-  learning_rate: 0.0001
-  warmup_steps: 8000
+  batch_size: 16
+  learning_rate: 0.001
+  warmup_steps: 1000
   weight_decay: 0.01
   epochs: 10
-  accumulation_steps: 2
+  accumulation_steps: 4
